@@ -3,32 +3,26 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	admissionv1 "k8s.io/api/admission/v1"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
 type M map[string]interface{}
 
-type StatefulSet struct {
+type Service struct {
+	Metadata struct {
+		Annotations *M `json:"annotations"`
+	} `json:"metadata"`
 	Spec struct {
-		Template struct {
-			Metadata struct {
-				Annotations *M `json:"annotations"`
-			} `json:"metadata"`
-			Spec struct {
-				Containers []struct {
-					Resources *struct {
-						Limits   *M `json:"limits"`
-						Requests *M `json:"requests"`
-					} `json:"resources"`
-				} `json:"containers"`
-			} `json:"spec"`
-		} `json:"template"`
+		Type string `json:"type"`
 	} `json:"spec"`
 }
 
@@ -53,6 +47,21 @@ func main() {
 	log.SetFlags(0)
 	log.SetOutput(os.Stdout)
 
+	cfgSubnet := strings.TrimSpace(os.Getenv("CFG_SUBNET"))
+	if cfgSubnet == "" {
+		err = errors.New("missing environment variable $LB_SUBNET")
+		return
+	}
+	cfgMatchNamespace := strings.TrimSpace(os.Getenv("CFG_MATCH_NS"))
+	if cfgMatchNamespace == "" {
+		err = errors.New("missing environment variable $CFG_MATCH_NS")
+		return
+	}
+	var matchNamespace *regexp.Regexp
+	if matchNamespace, err = regexp.Compile(cfgMatchNamespace); err != nil {
+		return
+	}
+
 	s := &http.Server{
 		Addr: ":443",
 		Handler: http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -70,84 +79,52 @@ func main() {
 
 			// patches
 			var buf []byte
-			var sts StatefulSet
+			var svc Service
 
 			if buf, err = review.Request.Object.MarshalJSON(); err != nil {
 				log.Println("Failed to marshal object to json:", err.Error())
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if err = json.Unmarshal(buf, &sts); err != nil {
-				log.Println("Failed to unmarshal object to statefulset:", err.Error())
+			if err = json.Unmarshal(buf, &svc); err != nil {
+				log.Println("Failed to unmarshal object to service:", err.Error())
 				http.Error(rw, err.Error(), http.StatusBadRequest)
 				return
 			}
 
 			// build patches
-			var patches []M
-			if sts.Spec.Template.Metadata.Annotations == nil {
-				patches = append(patches, M{
-					"op":    "replace",
-					"path":  "/spec/template/metadata/annotations",
-					"value": M{},
-				})
-			}
-			patches = append(patches, M{
-				"op":    "replace",
-				"path":  "/spec/template/metadata/annotations/tke.cloud.tencent.com~1networks",
-				"value": "tke-route-eni",
-			})
-			patches = append(patches, M{
-				"op":    "replace",
-				"path":  "/spec/template/metadata/annotations/tke.cloud.tencent.com~1vpc-ip-claim-delete-policy",
-				"value": "Never",
-			})
-			c := sts.Spec.Template.Spec.Containers[0]
-			if c.Resources == nil {
-				patches = append(patches, M{
-					"op":    "replace",
-					"path":  "/spec/template/spec/containers/0/resources",
-					"value": M{},
-				})
-			}
-			if c.Resources == nil || c.Resources.Limits == nil {
-				patches = append(patches, M{
-					"op":    "replace",
-					"path":  "/spec/template/spec/containers/0/resources/limits",
-					"value": M{},
-				})
-			}
-			if c.Resources == nil || c.Resources.Requests == nil {
-				patches = append(patches, M{
-					"op":    "replace",
-					"path":  "/spec/template/spec/containers/0/resources/requests",
-					"value": M{},
-				})
-			}
-			patches = append(patches, M{
-				"op":    "replace",
-				"path":  "/spec/template/spec/containers/0/resources/limits/tke.cloud.tencent.com~1eni-ip",
-				"value": "1",
-			})
-			patches = append(patches, M{
-				"op":    "replace",
-				"path":  "/spec/template/spec/containers/0/resources/requests/tke.cloud.tencent.com~1eni-ip",
-				"value": "1",
-			})
-
 			// build response
 			var patchJSON []byte
-			if patchJSON, err = json.Marshal(patches); err != nil {
-				log.Println("Failed to marshal patches:", err.Error())
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
+			var patchType *admissionv1.PatchType
+
+			if svc.Spec.Type == "LoadBalancer" && matchNamespace.MatchString(review.Request.Namespace) {
+				var patches []M
+				if svc.Metadata.Annotations == nil {
+					patches = append(patches, M{
+						"op":    "replace",
+						"path":  "/metadata/annotations",
+						"value": M{},
+					})
+				}
+				patches = append(patches, M{
+					"op":    "replace",
+					"path":  "/metadata/annotations/service.kubernetes.io~1qcloud-loadbalancer-internal-subnetid",
+					"value": cfgSubnet,
+				})
+				if patchJSON, err = json.Marshal(patches); err != nil {
+					log.Println("Failed to marshal patches:", err.Error())
+					http.Error(rw, err.Error(), http.StatusBadRequest)
+					return
+				}
+				patchType = new(admissionv1.PatchType)
+				*patchType = admissionv1.PatchTypeJSONPatch
 			}
-			patchType := admissionv1.PatchTypeJSONPatch
+
 			review.Response = &admissionv1.AdmissionResponse{
 				UID:       review.Request.UID,
 				Allowed:   true,
 				Patch:     patchJSON,
-				PatchType: &patchType,
+				PatchType: patchType,
 			}
 			review.Request = nil
 

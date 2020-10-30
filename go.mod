@@ -1,4 +1,4 @@
-module github.com/k8s-autoops/enforce-qcloud-fixed-ip
+module github.com/k8s-autoops/enforce-qcloud-internal-lb
 
 go 1.14
 
