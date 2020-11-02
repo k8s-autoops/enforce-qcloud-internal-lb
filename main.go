@@ -3,32 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"github.com/k8s-autoops/autoops"
 	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
-	"regexp"
-	"strconv"
-	"strings"
-	"syscall"
 )
 
-type M map[string]interface{}
-
-type Service struct {
-	Metadata struct {
-		Annotations *M `json:"annotations"`
-	} `json:"metadata"`
-	Spec struct {
-		Type string `json:"type"`
-	} `json:"spec"`
-}
-
 const (
-	certFile = "/autoops-data/tls/tls.crt"
-	keyFile  = "/autoops-data/tls/tls.key"
+	AnnotationKeySubnet = "autoops.enforce-qcloud-internal-lb/subnet"
 )
 
 func exit(err *error) {
@@ -47,111 +33,57 @@ func main() {
 	log.SetFlags(0)
 	log.SetOutput(os.Stdout)
 
-	cfgSubnet := strings.TrimSpace(os.Getenv("CFG_SUBNET"))
-	if cfgSubnet == "" {
-		err = errors.New("missing environment variable $LB_SUBNET")
-		return
-	}
-	cfgMatchNamespace := strings.TrimSpace(os.Getenv("CFG_MATCH_NS"))
-	if cfgMatchNamespace == "" {
-		err = errors.New("missing environment variable $CFG_MATCH_NS")
-		return
-	}
-	var matchNamespace *regexp.Regexp
-	if matchNamespace, err = regexp.Compile(cfgMatchNamespace); err != nil {
+	var client *kubernetes.Clientset
+	if client, err = autoops.InClusterClient(); err != nil {
 		return
 	}
 
 	s := &http.Server{
 		Addr: ":443",
-		Handler: http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-			// decode request
-			var review admissionv1.AdmissionReview
-			if err := json.NewDecoder(req.Body).Decode(&review); err != nil {
-				log.Println("Failed to decode a AdmissionReview:", err.Error())
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			// log
-			reviewPrettyJSON, _ := json.MarshalIndent(&review, "", "  ")
-			log.Println(string(reviewPrettyJSON))
-
-			// patches
-			var buf []byte
-			var svc Service
-
-			if buf, err = review.Request.Object.MarshalJSON(); err != nil {
-				log.Println("Failed to marshal object to json:", err.Error())
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
-			}
-			if err = json.Unmarshal(buf, &svc); err != nil {
-				log.Println("Failed to unmarshal object to service:", err.Error())
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
-			}
-
-			// build patches
-			// build response
-			var patchJSON []byte
-			var patchType *admissionv1.PatchType
-
-			if svc.Spec.Type == "LoadBalancer" && matchNamespace.MatchString(review.Request.Namespace) {
-				var patches []M
-				if svc.Metadata.Annotations == nil {
-					patches = append(patches, M{
-						"op":    "replace",
-						"path":  "/metadata/annotations",
-						"value": M{},
-					})
-				}
-				patches = append(patches, M{
-					"op":    "replace",
-					"path":  "/metadata/annotations/service.kubernetes.io~1qcloud-loadbalancer-internal-subnetid",
-					"value": cfgSubnet,
-				})
-				if patchJSON, err = json.Marshal(patches); err != nil {
-					log.Println("Failed to marshal patches:", err.Error())
-					http.Error(rw, err.Error(), http.StatusBadRequest)
+		Handler: autoops.NewMutatingAdmissionHTTPHandler(
+			func(ctx context.Context, request *admissionv1.AdmissionRequest, patches *[]map[string]interface{}) (err error) {
+				var buf []byte
+				if buf, err = request.Object.MarshalJSON(); err != nil {
 					return
 				}
-				patchType = new(admissionv1.PatchType)
-				*patchType = admissionv1.PatchTypeJSONPatch
-			}
-
-			review.Response = &admissionv1.AdmissionResponse{
-				UID:       review.Request.UID,
-				Allowed:   true,
-				Patch:     patchJSON,
-				PatchType: patchType,
-			}
-			review.Request = nil
-
-			// send response
-			reviewJSON, _ := json.Marshal(review)
-			rw.Header().Set("Content-Type", "application/json")
-			rw.Header().Set("Content-Length", strconv.Itoa(len(reviewJSON)))
-			_, _ = rw.Write(reviewJSON)
-		}),
+				var svc corev1.Service
+				if err = json.Unmarshal(buf, &svc); err != nil {
+					return
+				}
+				// 如果不是 LoadBalancer 则忽略
+				if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+					return
+				}
+				// 获取命名空间并检查特定注解
+				var ns *corev1.Namespace
+				if ns, err = client.CoreV1().Namespaces().Get(ctx, request.Namespace, metav1.GetOptions{}); err != nil {
+					return
+				}
+				if ns.Annotations == nil {
+					return
+				}
+				if ns.Annotations[AnnotationKeySubnet] == "" {
+					return
+				}
+				// 增加注解
+				if svc.Annotations == nil {
+					*patches = append(*patches, map[string]interface{}{
+						"op":    "replace",
+						"path":  "/metadata/annotations",
+						"value": map[string]interface{}{},
+					})
+				}
+				*patches = append(*patches, map[string]interface{}{
+					"op":    "replace",
+					"path":  "/metadata/annotations/service.kubernetes.io~1qcloud-loadbalancer-internal-subnetid",
+					"value": ns.Annotations[AnnotationKeySubnet],
+				})
+				return
+			},
+		),
 	}
 
-	// channels
-	chErr := make(chan error, 1)
-	chSig := make(chan os.Signal, 1)
-	signal.Notify(chSig, syscall.SIGTERM, syscall.SIGINT)
-
-	// start server
-	go func() {
-		log.Println("listening at :443")
-		chErr <- s.ListenAndServeTLS(certFile, keyFile)
-	}()
-
-	// wait signal or failed start
-	select {
-	case err = <-chErr:
-	case sig := <-chSig:
-		log.Println("signal caught:", sig.String())
-		_ = s.Shutdown(context.Background())
+	if err = autoops.RunAdmissionServer(s); err != nil {
+		return
 	}
 }
