@@ -75,7 +75,8 @@ spec:
 
 * 为需要启用的命名空间，添加注解，指明要使用的内网
 
-  `autoops.enforce-qcloud-internal-lb/subnet=subnet-xxxxxx`
+  * 指定子网 `autoops.enforce-qcloud-internal-lb/subnet=subnet-xxxxxx`
+  * 开启直连 `autoops.enforce-qcloud-internal-lb/direct=true`
   
   **可以配合 `enforce-ns-annotations` 自动为新命名空间启用此注解**
 

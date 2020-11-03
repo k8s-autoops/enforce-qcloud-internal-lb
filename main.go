@@ -11,10 +11,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 )
 
 const (
 	AnnotationKeySubnet = "autoops.enforce-qcloud-internal-lb/subnet"
+	AnnotationKeyDirect = "autoops.enforce-qcloud-internal-lb/direct"
 )
 
 func exit(err *error) {
@@ -78,6 +80,13 @@ func main() {
 					"path":  "/metadata/annotations/service.kubernetes.io~1qcloud-loadbalancer-internal-subnetid",
 					"value": ns.Annotations[AnnotationKeySubnet],
 				})
+				if direct, _ := strconv.ParseBool(ns.Annotations[AnnotationKeyDirect]); direct {
+					*patches = append(*patches, map[string]interface{}{
+						"op":    "replace",
+						"path":  "/metadata/annotations/service.cloud.tencent.com~1direct-access",
+						"value": "true",
+					})
+				}
 				return
 			},
 		),
